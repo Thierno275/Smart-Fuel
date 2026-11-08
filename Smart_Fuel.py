@@ -9,6 +9,11 @@ import json
 
 model = joblib.load("model_rf.pkl")
 
+st.set_page_config(
+    page_title="Smart Fuel",
+    layout="wide"
+)
+
 st.title("⛽ Smart Fuel")
 st.write("Trouvez la station la moins chère autour de vous")
 
@@ -161,10 +166,15 @@ df = df.dropna(subset=["Carburant",'Prix', 'Latitude', 'Longitude'])
 
 data = df 
 
-if 'geom' in data.columns:
-    data[['Latitude', 'Longitude']] = data['geom'].str.split(',', expand=True)
-    data['Latitude'] = data['Latitude'].str.strip().astype(float)
-    data['Longitude'] = data['Longitude'].str.strip().astype(float)
+# Certaines versions de l'API exposent les coordonnées dans geom.lat / geom.lon,
+# d'autres sous forme de chaîne "latitude, longitude" dans geom.
+if 'geom' in data.columns and data[['Latitude', 'Longitude']].isna().any(axis=None):
+    geom_coords = data['geom'].astype(str).str.split(',', n=1, expand=True)
+    if geom_coords.shape[1] == 2:
+        lat_geom = pd.to_numeric(geom_coords[0].str.strip(), errors='coerce')
+        lon_geom = pd.to_numeric(geom_coords[1].str.strip(), errors='coerce')
+        data['Latitude'] = data['Latitude'].fillna(lat_geom)
+        data['Longitude'] = data['Longitude'].fillna(lon_geom)
 
 #st.write(data[['date', 'Carburant', 'Prix', 'Latitude', 'Longitude' ]].head())    
 
@@ -200,14 +210,105 @@ col5.metric("⛽ Stations", nb_stations)
 
 # 📍 Étape 4 : localisation utilisateur
 
-st.sidebar.header("📍 Votre position")
+#st.sidebar.header("📍 Votre position")
 
-user_lat = st.sidebar.number_input("Latitude", value=48.85)
-user_lon = st.sidebar.number_input("Longitude", value=2.35)
+#user_lat = st.sidebar.number_input("Latitude", value=48.85)
+#user_lon = st.sidebar.number_input("Longitude", value=2.35)
+
+#rayon = st.sidebar.slider("Rayon (km)", 1, 50, 10)
+
+from streamlit_js_eval import get_geolocation
+
+@st.cache_data(ttl=3600)
+def rechercher_communes_france(terme: str):
+    """Recherche une commune ou un code postal via l'API officielle geo.api.gouv.fr."""
+    terme = terme.strip()
+    if not terme:
+        return []
+
+    base_url = "https://geo.api.gouv.fr/communes"
+    params = {
+        "fields": "nom,centre,codesPostaux",
+        "format": "json",
+        "geometry": "centre",
+        "boost": "population",
+        "limit": 10,
+    }
+    if terme.isdigit():
+        params["codePostal"] = terme
+    else:
+        params["nom"] = terme
+
+    try:
+        response = requests.get(base_url, params=params, timeout=10)
+        response.raise_for_status()
+        communes = response.json()
+        return [c for c in communes if c.get("centre", {}).get("coordinates")]
+    except requests.RequestException as exc:
+        st.sidebar.error(f"Impossible de rechercher cette commune : {exc}")
+        return []
+
+st.sidebar.header("📍 Votre position")
+mode_localisation = st.sidebar.radio(
+    "Comment souhaitez-vous définir votre position ?",
+    ["Ma position GPS", "Rechercher une ville ou un code postal"],
+    key="mode_localisation",
+)
+
+user_lat = None
+user_lon = None
+
+if mode_localisation == "Ma position GPS":
+    location = get_geolocation()
+
+    if isinstance(location, dict) and location.get("coords"):
+        coords = location["coords"]
+        user_lat = coords.get("latitude")
+        user_lon = coords.get("longitude")
+
+    if user_lat is not None and user_lon is not None:
+        user_lat = float(user_lat)
+        user_lon = float(user_lon)
+        st.sidebar.success("Position GPS détectée ✅")
+        st.sidebar.caption(f"Coordonnées : {user_lat:.4f}, {user_lon:.4f}")
+    else:
+        st.sidebar.warning(
+            "Position GPS indisponible. Autorisez la localisation dans votre navigateur "
+            "ou choisissez la recherche manuelle."
+        )
+else:
+    recherche = st.sidebar.text_input(
+        "Ville ou code postal",
+        placeholder="Ex. : Lyon ou 69002",
+        key="recherche_localisation",
+    )
+    if st.sidebar.button("Rechercher cette zone", use_container_width=True):
+        communes = rechercher_communes_france(recherche)
+        if communes:
+            st.session_state["communes_trouvees"] = communes
+        else:
+            st.session_state.pop("communes_trouvees", None)
+            st.sidebar.warning("Aucune commune trouvée. Vérifiez votre saisie.")
+
+    communes = st.session_state.get("communes_trouvees", [])
+    if communes:
+        choix = st.sidebar.selectbox(
+            "Sélectionnez la commune",
+            communes,
+            format_func=lambda c: f"{c['nom']} ({', '.join(c.get('codesPostaux', []))})",
+            key="commune_selectionnee",
+        )
+        # L'API renvoie les coordonnées dans l'ordre longitude, latitude.
+        user_lon, user_lat = choix["centre"]["coordinates"]
+        user_lat = float(user_lat)
+        user_lon = float(user_lon)
+        st.sidebar.success(f"Zone sélectionnée : {choix['nom']} ✅")
+
+if user_lat is None or user_lon is None:
+    st.info("Définissez votre position GPS ou recherchez une ville / un code postal pour afficher les stations proches.")
+    st.stop()
 
 rayon = st.sidebar.slider("Rayon (km)", 1, 50, 10)
-
-
 
 # 📏 Étape 5 : fonction distance
 
@@ -354,22 +455,24 @@ st.success(
 
 # Géolocalisation Automatique
 
-from streamlit_js_eval import get_geolocation
+#from streamlit_js_eval import get_geolocation
 
-st.sidebar.header("📍 Votre position")
+#st.sidebar.header("📍 Votre position")
 
-location = get_geolocation()
+#location = get_geolocation()
 
-if location:
-    user_lat = location['coords']['latitude']
-    user_lon = location['coords']['longitude']
+#if location: 
+
+#user_lat = location['coords']['latitude']
+#user_lon = location['coords']['longitude']
     
-    st.sidebar.success("Position détectée ✅")
-    st.sidebar.write(f"Lat: {user_lat:.4f}, Lon: {user_lon:.4f}")
-else:
-    st.sidebar.warning("Autorisez la géolocalisation")
-    user_lat = st.sidebar.number_input("Latitude", value=48.85)
-    user_lon = st.sidebar.number_input("Longitude", value=2.35)
+#st.sidebar.success("Position détectée ✅")
+#st.sidebar.write(f"Lat: {user_lat:.4f}, Lon: {user_lon:.4f}")
+#else:
+
+#st.sidebar.warning("Autorisez la géolocalisation")
+#  user_lat = st.sidebar.number_input("Latitude", value=48.85)
+# user_lon = st.sidebar.number_input("Longitude", value=2.35)
 
 # 🗺️ Carte interactive avancée
 
@@ -413,8 +516,6 @@ st_folium(m, width=700, height=500)
 
 
 # 🎨 Mise en page
-
-st.set_page_config(layout="wide")
 
 # 📊 Organisation en colonnes
 
